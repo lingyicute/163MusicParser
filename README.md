@@ -1,4 +1,4 @@
-# NeteaseMusicParser
+# 163MusicParser
 
 Netease Music Playlist Parser
 
