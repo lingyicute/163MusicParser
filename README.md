@@ -9,7 +9,7 @@ Netease Music Playlist Parser
 
 ## 🗂️ License
 
-NeteaseMusicParser is released under the GNU Affero General Public License v3.0 (AGPLv3).
+163MusicParser is released under the GNU Affero General Public License v3.0 (AGPLv3).
 
 Copyright (C) 2026 lingyicute.
 
