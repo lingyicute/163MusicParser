@@ -329,6 +329,14 @@ html[data-theme="dark"] .blob-layer-dark { opacity:var(--blob-op-dark); }
   display:flex; align-items:center; gap:7px;
 }
 .card .t .tt{ min-width:0; }
+/* VIP 标记 */
+.card .vip-tag{
+  flex:none; display:inline-flex; align-items:center; gap:3px;
+  background:var(--tertiary-container); color:var(--on-tertiary-container);
+  font-size:10px; font-weight:700; letter-spacing:.08em; line-height:1.5;
+  padding:1.5px 7px; border-radius:99px;
+}
+.card .vip-tag svg{ width:11px; height:11px; flex:none; }
 .card .playing-eq{ display:none; align-items:flex-end; gap:2.5px; height:14px; flex:none; }
 .card.playing .playing-eq{ display:inline-flex; }
 .card .playing-eq i{ width:3px; background:var(--primary); border-radius:2px; animation:eq .9s ease-in-out infinite; }
@@ -432,6 +440,17 @@ html[data-theme="dark"] .blob-layer-dark { opacity:var(--blob-op-dark); }
 }
 .song-author span{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .song-author svg{ width:15px; height:15px; flex:none; }
+/* VIP 独家解析提示 */
+.vip-exclusive{
+  display:none; align-items:center; gap:7px; align-self:flex-start;
+  background:var(--dpc, var(--primary-container)); color:var(--dopc, var(--on-primary-container));
+  padding:8px 16px; border-radius:99px;
+  font-size:12.5px; font-weight:600; letter-spacing:.04em;
+  max-width:100%;
+}
+.vip-exclusive.show{ display:inline-flex; animation:cardIn .6s var(--ease-emph) both; }
+.vip-exclusive svg{ width:15px; height:15px; flex:none; }
+.vip-exclusive span{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .mid-note{ font-size:11.5px; color:var(--on-surface-variant); letter-spacing:.06em; word-break:break-all; }
 
 /* transport */
@@ -712,6 +731,10 @@ html.theme-switching .blob-layer{ transition:opacity .45s var(--ease-std) !impor
           <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
           <span id="songAuthor">—</span>
         </span>
+        <span class="vip-exclusive" id="vipExclusive">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 9l1.25-2.75L23 5l-2.75-1.25L19 1l-1.25 2.75L15 5l2.75 1.25L19 9zm-7.5.5L9 4 6.5 9.5 1 12l5.5 2.5L9 20l2.5-5.5L17 12l-5.5-2.5zM19 15l-1.25 2.75L15 19l2.75 1.25L19 23l1.25-2.75L23 19l-2.75-1.25L19 15z"/></svg>
+          <span>YiClapOnline 独家为您解析 VIP 歌曲</span>
+        </span>
         <span class="mid-note" id="midNote"></span>
       </div>
       <div class="lyrics-col">
@@ -783,6 +806,77 @@ const api = (type,id) => `https://vercel-meting-api.musifei.org/api?server=${MUS
 function extractSongId(item){
   const m = /[?&]id=(\d+)/.exec((item && (item.url || item.lrc)) || "");
   return m ? m[1] : "";
+}
+
+/* 统一歌手分隔符为 " / "（与 musifei 源的数据格式一致）。
+ * 目的：保证 songStem 跨源一致 —— 同一首歌无论经哪个源播放，
+ * 收集库去重（list.txt）与归档目录名都相同，不会重复采集。 */
+function normalizeSinger(s){
+  return String(s || "").split("/").map(t => t.trim()).filter(Boolean).join(" / ");
+}
+
+/* ================= 新数据源（nextmusic）=================
+ * 歌单用 playlist_trackall，点歌时用 getSongUrl / getSongLyric 实时解析。
+ * 新数据源不可用（网络异常 / 超时 / 非 200 / 拿不到地址）时，自动回退 musifei 源，
+ * 回退逻辑保留在各调用处（见 loadPlaylist / playAt / resolveLyrics）。 */
+const NEXTMUSIC_BASE = "https://nextmusic.toubiec.cn/api";
+const NEXTMUSIC_TIMEOUT = 12000; // 超时视为新源不可用，走 fallback
+
+function randomIp(){
+  return "112." + (114 + Math.floor(Math.random()*4)) // 112.114.x.x ~ 112.117.x.x
+       + "." + Math.floor(Math.random()*256)
+       + "." + Math.floor(Math.random()*256);
+}
+
+/* 底层：发起一次请求，返回 { ok, code, data, notFound, message }，业务失败不抛错。
+ * 该接口“歌单不存在”等错误用非 200 状态码返回、但 body 仍是结构化 JSON，统一解析。 */
+async function nextMusicRequest(path, body){
+  const ctrl = new AbortController();
+  const timer = setTimeout(()=>ctrl.abort(), NEXTMUSIC_TIMEOUT);
+  let r;
+  try{
+    r = await fetch(NEXTMUSIC_BASE + "/" + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(Object.assign({ ip: randomIp() }, body)),
+      signal: ctrl.signal
+    });
+  }catch(e){
+    clearTimeout(timer);
+    return { ok:false, code:0, data:null, notFound:false,
+             message:(e && e.name === "AbortError") ? "请求超时" : "网络异常" };
+  }
+  clearTimeout(timer);
+  let j = null;
+  try{ j = await r.json(); }catch(_){ /* body 非 JSON */ }
+  if(!j) return { ok:false, code:r.status, data:null, notFound:r.status === 404,
+                  message:"HTTP " + r.status };
+  if(j.code !== 200){
+    return { ok:false, code:j.code, data:j.data || null,
+             notFound:j.code === 404 || /不存在/.test(String(j.message || "")),
+             message:j.message || ("接口返回 code " + j.code) };
+  }
+  return { ok:true, code:200, data:j.data || null, notFound:false, message:"" };
+}
+
+/* 带重试的封装：实测该服务后端会轮换账号，单次请求可能间歇性返回 404 / data:null。
+ * 对「瞬时失败」按 isTransient 判定自动重试（每次换新随机 ip）；
+ * 确定性结果（如 url:null 版权受限、拿到歌词文本）不重试，直接返回。
+ * 重试耗尽仍失败时抛错（404 类带 err.notFound），由调用方走 musifei fallback。 */
+async function nextMusicApi(path, body, retries = 0, isTransient){
+  for(let i = 0; ; i++){
+    const res = await nextMusicRequest(path, body);
+    if(res.ok) return res.data;
+    const transient = typeof isTransient === "function"
+      ? isTransient(res)
+      : (res.code === 0 || res.code >= 500); // 默认：仅网络/5xx 视为瞬时失败
+    if(!transient || i >= retries){
+      const err = new Error(res.message || "新数据源请求失败");
+      if(res.notFound) err.notFound = true;
+      throw err;
+    }
+    await new Promise(rt => setTimeout(rt, 350 + Math.random()*450));
+  }
 }
 
 /* ================= 收集库相关 =================
@@ -865,13 +959,32 @@ async function resolveCoverUrl(song){
   return (await getCollectionFileUrl(song, "cover")) || "";
 }
 
-/* 歌词解析：歌单 lrc → 缺失时用 song API 补一次 → 收集库兜底（fire-and-forget，token 做过期保护）*/
+/* 歌词解析：
+ *  - musifei 源：歌单自带 lrc（url）→ 缺失时用 song API 补一次；
+ *  - 新数据源：点击时实时调 getSongLyric，直接返回 LRC 文本，无需二次抓取；
+ *  - 都拿不到时收集库兜底。（fire-and-forget，token 做过期保护）*/
 async function resolveLyrics(song, token){
   const alive = () => token === state.token;
   if(song.lrc) loadLyrics(song.lrc, token); // loadLyrics 内部先渲染骨架
+  else if(song.lrcText) showLrcText(song.lrcText, token); // 本首已解析过的歌词，直接复用
   else renderLyricsSkeleton();               // 先占位，避免残留上一首歌词
-  // 歌单没带 lrc 才去 song API 补一次（只取 lrc，url 字段忽略）
-  if(!song.lrc && song.songmid){
+  // 新数据源：点击时实时解析歌词
+  if(!song.lrc && !song.lrcText && song.source === "nextmusic" && song.songmid){
+    try{
+      /* 拿到歌词文本（含“暂无歌词”）时 nextMusicRequest 直接 ok 返回、不会进入重试；
+         能触发重试的都是瞬时失败（后端 404 / 超时 / 网络异常）→ 一律重试 */
+      const data = await nextMusicApi("getSongLyric", { id: song.songmid }, 2, () => true);
+      if(!alive()) return;
+      const lrcText = data && typeof data.lrc === "string" ? data.lrc.trim() : "";
+      if(lrcText && lrcText !== "[00:00.00]暂无歌词"){
+        song.lrcText = lrcText;
+        showLrcText(lrcText, token);
+        return;
+      }
+    }catch(_){ /* 新源不可用 → 继续走下面的回退 */ }
+  }
+  // 歌单没带 lrc 才去 song API 补一次（musifei 回退；只取 lrc，url 字段忽略）
+  if(!song.lrc && !song.lrcText && song.songmid){
     try{
       const r = await fetch(api("song", song.songmid));
       const arr = await r.json();
@@ -881,7 +994,7 @@ async function resolveLyrics(song, token){
     }catch(_){ /* 在线失败则继续走兜底 */ }
   }
   if(!alive()) return;
-  if(song.lrc) return; // 在线已有（歌单自带或刚补到），不再兜底
+  if(song.lrc || song.lrcText) return; // 在线已有（歌单自带 / 刚补到 / 新源已解析），不再兜底
   const colUrl = await getCollectionFileUrl(song, "lyric");
   if(!alive()) return;
   if(colUrl) loadLyrics(colUrl, token);
@@ -913,13 +1026,15 @@ function reportToCollector(song, fileUrl){
       const dur = probe.duration;
       cleanup();
       if(!isFinite(dur) || dur <= COLLECTOR_MIN_DURATION) return; // ≤60 秒不上报
-      // 在上报时刻再读取 song.lrc，保证拿到 song API 刷新后的最新歌词 url
+      // 在上报时刻再读取 song.lrc，保证拿到 song API 刷新后的最新歌词 url；
+      // 新源歌曲的歌词是文本（无 URL），用 musifei 稳定 lrc 代理 URL 补上，
+      // 保证收集库归档时同样能拿到歌词（与原有上报格式一致）
       const payload = {
         title:  song.title  || "",
         author: song.author || "",
         pic:    song.pic    || "",
         url:    fileUrl,
-        lrc:    song.lrc    || "",
+        lrc:    song.lrc    || (song.songmid ? api("lrc", song.songmid) : ""),
         songmid:  song.songmid || "",
         duration: Math.round(dur)
       };
@@ -1097,7 +1212,8 @@ audio.volume = .8;
 const playBtn=$("#playBtn"), icPlay=$("#icPlay"), icPause=$("#icPause"), spin=$("#spin");
 const seekSlider=$("#seekSlider"), curTime=$("#curTime"), durTime=$("#durTime");
 const volSlider=$("#volSlider"), volBtn=$("#volBtn"), icVol=$("#icVol"), icMute=$("#icMute");
-const dlgStatus=$("#dlgStatus"), dlgStatusText=$("#dlgStatusText");
+const dlgStatus=$("#dlgStatus"), dlgStatusText=$("#dlgStatusText"),
+      vipExclusiveEl=$("#vipExclusive");
 let seeking=false;
 
 function setPlayUI(mode){ // 'loading' | 'play' | 'pause'
@@ -1114,7 +1230,21 @@ playBtn.addEventListener("click", ()=>{
 });
 audio.addEventListener("play",  ()=>{ setPlayUI("pause"); markPlayingCard(true); });
 audio.addEventListener("pause", ()=>{ setPlayUI("play");  markPlayingCard(false); });
-audio.addEventListener("loadedmetadata", ()=>{ durTime.textContent = fmtTime(audio.duration); });
+audio.addEventListener("loadedmetadata", ()=>{
+  durTime.textContent = fmtTime(audio.duration);
+  checkVipExclusive();
+});
+/* VIP 独家解析提示：
+ * 条件 = 本曲是 VIP（新源 free:false）+ 播放地址来自新数据源（getSongUrl）
+ *       + 实际时长 > 60 秒（与收藏库上报同一标准，即完整歌曲而非试听片段） */
+function checkVipExclusive(){
+  const idx = state.currentIndex;
+  const song = idx >= 0 ? state.songs[idx] : null;
+  if(!song || !song.vip || !state.urlFromNextMusic) return;
+  if(!state.lastMediaUrl || audio.currentSrc !== state.lastMediaUrl) return; // 防串曲：metadata 必须属于当前地址
+  if(!isFinite(audio.duration) || audio.duration <= COLLECTOR_MIN_DURATION) return;
+  vipExclusiveEl.classList.add("show");
+}
 audio.addEventListener("timeupdate", ()=>{
   if(!seeking && isFinite(audio.duration) && audio.duration>0){
     seekSlider.value = Math.round(audio.currentTime / audio.duration * 1000);
@@ -1252,6 +1382,11 @@ function syncLyrics(t){
   }
 }
 function centerTarget(v){ return Math.max(0, v); }
+/* 直接渲染 LRC 文本（新数据源 getSongLyric 返回的就是文本本身） */
+function showLrcText(text, token){
+  if(token!==state.token) return;
+  renderLyrics(parseLRC(text));
+}
 async function loadLyrics(url, token){
   renderLyricsSkeleton();
   try{
@@ -1262,8 +1397,7 @@ async function loadLyrics(url, token){
     if(t.startsWith("{")){ try{ const j=JSON.parse(t); text=j.lyric||j.lrc||j.data||text; }catch(_){}
       if(typeof text!=="string") text=String(text);
     }
-    if(token!==state.token) return;
-    renderLyrics(parseLRC(text));
+    showLrcText(text, token);
   }catch(_){
     if(token!==state.token) return;
     renderLyrics([]);
@@ -1271,7 +1405,11 @@ async function loadLyrics(url, token){
 }
 
 /* ================= State ================= */
-const state = { songs:[], currentIndex:-1, token:0, mode:"list" /* list | one | once */, skipCount:0 };
+const state = {
+  songs:[], currentIndex:-1, token:0, mode:"list" /* list | one | once */, skipCount:0,
+  urlFromNextMusic:false, // 当前播放地址是否来自新数据源（getSongUrl）
+  lastMediaUrl:""         // 当前 audio.src 对应的 url，供 loadedmetadata 防串曲校验
+};
 
 /* ================= Play Mode Switch ================= */
 /* list = 列表循环；one = 单曲循环；once = 仅播放此曲目一次 */
@@ -1326,6 +1464,8 @@ function closeDialog(){
   audio.pause(); audio.removeAttribute("src"); audio.load();
   state.token++;
   markPlayingCard(false); state.currentIndex=-1;
+  vipExclusiveEl.classList.remove("show");
+  state.urlFromNextMusic=false; state.lastMediaUrl="";
   clearDynamicPalette();
   document.title = "Netease Music Playlist Parser by lingyicute";
 }
@@ -1387,6 +1527,9 @@ async function playAt(index, auto=false){
   curTime.textContent="0:00"; durTime.textContent="0:00";
   setPlayUI("loading");
   dlgStatus.classList.remove("show"); // 播放地址已在歌单数据里，无需“解析中”提示
+  vipExclusiveEl.classList.remove("show"); // 每首新歌曲重置 VIP 独家解析提示
+  state.urlFromNextMusic = false;
+  state.lastMediaUrl = "";
   audio.pause(); audio.removeAttribute("src");
 
   // Dynamic accent from cover (non-blocking, uses effective cover incl. collection fallback)
@@ -1398,23 +1541,44 @@ async function playAt(index, auto=false){
     }
   });
 
-  // Lyrics：在线（歌单 lrc → 缺失时 song API 补取）优先，都没有则用收集库兜底
+  // Lyrics：新源点击时实时解析（getSongLyric），musifei 源走歌单 lrc / song API，都没有则用收集库兜底
   resolveLyrics(song, token);
 
   let url = song.url || "";
   let fromCollection = false;
   if(url){
-    dlgStatus.classList.remove("show");
+    dlgStatus.classList.remove("show"); // musifei 源歌单数据已带播放地址，无需“解析中”提示
   }else{
     dlgStatus.classList.add("show");
-    dlgStatusText.textContent="接口未返回播放地址，正在尝试查询收集库…";
-    url = await getCollectionFileUrl(song, "audio");
-    if(token!==state.token) return;
-    dlgStatus.classList.remove("show");
-    if(url){
-      fromCollection = true;
-      dlgTag.textContent += " · 收集库";
+    dlgStatusText.textContent = "正在解析播放地址…";
+    // ① 新数据源：点击时实时解析（getSongUrl）
+    if(song.source === "nextmusic" && song.songmid){
+      try{
+        /* url:null（版权/付费）时 nextMusicRequest 直接 ok 返回、不会进入重试，
+           由调用方据 data.url 为空走回退；能触发重试的都是瞬时失败（404 / 超时 / 网络） */
+        const data = await nextMusicApi("getSongUrl", { id: song.songmid, level: "standard" }, 2, () => true);
+        if(token===state.token && data && data.url){ url = data.url; state.urlFromNextMusic = true; }
+      }catch(_){ /* 新源不可用 → ② musifei 回退 */ }
+      if(token!==state.token) return;
     }
+    // ② musifei 回退（新源拿不到地址时按歌曲 id 补查一次）
+    if(!url && song.songmid){
+      try{
+        const r = await fetch(api("song", song.songmid));
+        const arr = await r.json();
+        if(token===state.token && Array.isArray(arr) && arr[0] && arr[0].url) url = arr[0].url;
+      }catch(_){ /* 继续尝试收集库 */ }
+      if(token!==state.token) return;
+    }
+    // ③ 收集库兜底
+    if(!url){
+      dlgStatusText.textContent = "接口未返回播放地址，正在尝试查询收集库…";
+      url = await getCollectionFileUrl(song, "audio");
+      if(token!==state.token) return;
+      if(url) fromCollection = true;
+    }
+    dlgStatus.classList.remove("show");
+    if(fromCollection) dlgTag.textContent += " · 收集库";
   }
   if(!url){
     setPlayUI("play");
@@ -1424,6 +1588,7 @@ async function playAt(index, auto=false){
   // 上报收集器：成功拿到在线 url，后台校验实际时长 >60s 后自动上报（不阻塞播放）；
   // 收集库播出的本来就已收集，不上报
   if(!fromCollection) reportToCollector(song, url);
+  state.lastMediaUrl = url;
   audio.src=url;
   audio.play().then(()=>{
     if(token!==state.token) return;
@@ -1463,6 +1628,9 @@ function showState(icon, title, sub){
 }
 function hideState(){ stateMsg.style.display="none"; }
 
+const VIP_TAG_HTML = '<span class="vip-tag" aria-label="VIP 歌曲">'
+  + '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M5 16L3 7l5.5 3L12 4l3.5 6L21 7l-2 9H5zm0 2h14v2H5v-2z"/></svg>VIP</span>';
+
 function renderSongs(){
   grid.innerHTML="";
   state.songs.forEach((s,i)=>{
@@ -1470,7 +1638,7 @@ function renderSongs(){
     c.className="card ripple"; c.type="button"; c.dataset.i=i;
     c.dataset.key=((s.title||"")+" "+(s.author||"")).toLowerCase();
     c.style.animationDelay=Math.min(i*32, 640)+"ms";
-    c.setAttribute("aria-label", (s.title||"")+" - "+(s.author||""));
+    c.setAttribute("aria-label", (s.title||"")+" - "+(s.author||"")+(s.vip?"（VIP）":""));
     c.innerHTML = `
       <div class="art">
         <div class="ph"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg></div>
@@ -1478,7 +1646,7 @@ function renderSongs(){
         <div class="play-hint"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></div>
       </div>
       <div class="meta">
-        <p class="t"><span class="tt" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+        <p class="t"><span class="tt" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>${s.vip ? VIP_TAG_HTML : ""}
           <span class="playing-eq"><i></i><i></i><i></i></span></p>
         <p class="a"></p>
       </div>`;
@@ -1492,8 +1660,11 @@ function renderSongs(){
 }
 
 let plToken=0;
+let playlistMeta = null; // 新源返回的歌单元信息（名称 / 创建者），用于区头展示
+
 async function loadPlaylist(id){
   const token=++plToken;
+  playlistMeta = null;
   hideState();
   grid.innerHTML="";
   secHead.classList.remove("show");
@@ -1501,25 +1672,70 @@ async function loadPlaylist(id){
   skeletons(window.innerWidth<560 ? 6 : 10);
   hero.classList.add("compact");
 
+  const renderResult = (count, sub) => {
+    renderSongs();
+    secTitle.textContent = "解析成功";
+    secSub.textContent = sub + " · 共 " + count + " 首曲目";
+    secHead.classList.add("show");
+    snack("已解析 " + count + " 首曲目");
+  };
+  const notFoundState = () => {
+    grid.innerHTML="";
+    showState(
+      '<svg viewBox="0 0 24 24" fill="currentColor" width="36" height="36"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>',
+      "未找到该歌单", "请检查歌单 ID 是否正确，或更换一个试试");
+  };
+
   try{
-    const r = await fetch(api("playlist",id));
-    if(!r.ok) throw new Error("HTTP "+r.status);
+    // ① 新数据源（nextmusic）：playlist_trackall 一次拉全量
+    let notFound = false;
+    try{
+      /* “歌单不存在”是确定性结果，不重试；网络 / 5xx 等瞬时失败重试一次再走回退 */
+      const data = await nextMusicApi("playlist_trackall", { id: id, limit: 500, offset: 0 }, 1,
+        r => !r.notFound);
+      if(token!==plToken) return;
+      if(data && Array.isArray(data.songs) && data.songs.length){
+        playlistMeta = {
+          name: (data.name || "").trim(),
+          creator: ((data.creator && data.creator.name) || "").trim()
+        };
+        // 新源歌曲不带 url / lrc，点击时由 getSongUrl / getSongLyric 实时解析
+        state.songs = data.songs.map(s => ({
+          title: (s.name || "").trim(),
+          author: normalizeSinger(s.singer), // 分隔符统一为 " / "，保证收集库 stem 跨源一致
+          pic: s.picimg || "",
+          songmid: String(s.id), // 网易云歌曲数字 id，亦供收集库回退与上报收集器使用
+          duration: s.duration || "",
+          vip: s.free === false, // 新源 free:false = VIP 歌曲（copyright 仅指官方客户端免费下载，无意义）
+          source: "nextmusic"
+        }));
+        // “解析成功”下方显示歌单名称与作者（取代 Playlist #id），格式：名称 by 作者
+        const metaLabel = [playlistMeta.name, playlistMeta.creator].filter(Boolean).join(" by ")
+                        || ("Playlist #" + id);
+        renderResult(state.songs.length, metaLabel);
+        return;
+      }
+      notFound = true; // 新源返回空列表
+    }catch(err){
+      if(token!==plToken) return;
+      if(err && err.notFound) notFound = true; // 新源明确返回“歌单不存在”
+    }
+
+    // ② 回退：原 musifei 数据源（新源不可用时）
+    const r = await fetch(api("playlist", id));
+    if(!r.ok){
+      if(notFound){ notFoundState(); return; } // 两源均确认歌单不存在
+      throw new Error("HTTP " + r.status);
+    }
     const data = await r.json();
     if(token!==plToken) return;
     if(!Array.isArray(data) || !data.length){
-      grid.innerHTML="";
-      showState(
-        '<svg viewBox="0 0 24 24" fill="currentColor" width="36" height="36"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>',
-        "未找到该歌单", "请检查歌单 ID 是否正确，或更换一个试试");
+      notFoundState();
       return;
     }
     // 补上 songmid（= 网易云歌曲数字 id），供收集库回退与上报收集器使用
     state.songs = data.map(s => Object.assign({}, s, { songmid: extractSongId(s) }));
-    renderSongs();
-    secTitle.textContent = "解析成功";
-    secSub.textContent = "Playlist #"+id+" · 共 "+data.length+" 首曲目";
-    secHead.classList.add("show");
-    snack("已解析 "+data.length+" 首曲目");
+    renderResult(data.length, "Playlist #" + id);
   }catch(err){
     if(token!==plToken) return;
     grid.innerHTML="";
