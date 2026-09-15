@@ -1293,7 +1293,7 @@ audio.addEventListener("ended", ()=>{
 audio.addEventListener("error", ()=>{
   if(!audio.src) return;
   setPlayUI("play");
-  skipOnCopyright("音频加载失败，该歌曲可能受版权保护");
+  skipOnCopyright("音频加载失败，重新点击该歌曲试试");
 });
 seekSlider.addEventListener("input", ()=>{
   seeking=true;
