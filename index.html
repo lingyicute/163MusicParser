@@ -1274,15 +1274,48 @@ audio.addEventListener("play",  ()=>{ setPlayUI("pause"); markPlayingCard(true);
 audio.addEventListener("pause", ()=>{ setPlayUI("play");  markPlayingCard(false); });
 audio.addEventListener("loadedmetadata", ()=>{
   durTime.textContent = fmtTime(audio.duration);
+  if(skipBackupPreview()) return;   // 备用源试听片段已跳过，无需再判定 VIP 提示
   checkVipExclusive();
 });
+/* 备用源试听片段过滤（163 专用）：
+ * 备用源（musifei）对 VIP / 版权受限曲目常只返回 30 秒左右的试听片段，播放意义不大 → 整首直接跳过。
+ * 判据与收集库上报同一标准（COLLECTOR_MIN_DURATION = 60 秒）；在 loadedmetadata 判定，
+ * 此时尚未出声，因此不会播出片段。只作用于备用源地址：收集库归档文件与新数据源（nextmusic）不受影响。
+ * SKIP_BACKUP_PREVIEW = false 可关闭本过滤（试听片段照常播放）。 */
+const SKIP_BACKUP_PREVIEW = true;
+function skipBackupPreview(){
+  if(!SKIP_BACKUP_PREVIEW) return false;
+  const idx = state.currentIndex;
+  const song = idx >= 0 ? state.songs[idx] : null;
+  if(!song || !state.urlFromBackupSource) return false;
+  if(!state.lastMediaUrl || audio.currentSrc !== state.lastMediaUrl) return false; // 防串曲：metadata 必须属于当前地址
+  if(!isFinite(audio.duration) || audio.duration > COLLECTOR_MIN_DURATION) return false;
+  // 只加载了元数据、还没出声：停掉并清掉地址，再按“无法播放”走原有跳曲逻辑（列表循环下自动下一首，且有防死循环保护）
+  audio.pause();
+  audio.removeAttribute("src");
+  audio.load();
+  setPlayUI("play");
+  markPlayingCard(false);
+  curTime.textContent = "0:00"; durTime.textContent = "0:00";
+  skipOnCopyright("备用源仅提供试听片段（不足 1 分钟），已跳过");
+  return true;
+}
 /* VIP 独家解析提示：
- * 条件 = 本曲是 VIP（新源 free:false）+ 播放地址来自新数据源（getSongUrl）
- *       + 实际时长 > 60 秒（与收藏库上报同一标准，即完整歌曲而非试听片段） */
+ * 条件 = 本曲是 VIP（新源 free:false）
+ *       + 播放地址由我们交付：新数据源实时解析（getSongUrl）或收藏库归档文件
+ *       + 实际时长 > 60 秒（与收藏库上报同一标准，即完整歌曲而非试听片段）
+ *
+ * 注：抽到「收藏库优先」后，已在库中的 VIP 曲目不再打歌源，若判据仍只认 getSongUrl，
+ *     这些歌永远出不了提示（收藏库本身就是这套解析管线归档下来的，口径理当一致）。
+ *     VIP_TIP_INCLUDE_COLLECTION = false 可恢复改动前的严格口径（只在实时解析时提示）。 */
+const VIP_TIP_INCLUDE_COLLECTION = true;
 function checkVipExclusive(){
   const idx = state.currentIndex;
   const song = idx >= 0 ? state.songs[idx] : null;
-  if(!song || !song.vip || !state.urlFromNextMusic) return;
+  if(!song || !song.vip) return;
+  const servedByUs = state.urlFromNextMusic ||
+                     (VIP_TIP_INCLUDE_COLLECTION && state.playingFromCollection);
+  if(!servedByUs) return;   // musifei 等其它来源解析出的地址：不算我们的独家解析
   if(!state.lastMediaUrl || audio.currentSrc !== state.lastMediaUrl) return; // 防串曲：metadata 必须属于当前地址
   if(!isFinite(audio.duration) || audio.duration <= COLLECTOR_MIN_DURATION) return;
   vipExclusiveEl.classList.add("show");
@@ -1458,6 +1491,7 @@ const state = {
   urlFromNextMusic:false, // 当前播放地址是否来自新数据源（getSongUrl）
   lastMediaUrl:"",        // 当前 audio.src 对应的 url，供 loadedmetadata 防串曲校验
   playingFromCollection:false, // 当前播放地址是否来自收集库（文件异常时回退音乐源用）
+  urlFromBackupSource:false,   // 当前播放地址是否来自备用源 musifei（试听片段过滤用）
   collectionFallbackDone:false // 本曲是否已因收集库文件异常回退过音乐源（防循环）
 };
 
@@ -1581,6 +1615,7 @@ async function playAt(index, auto=false, opts={}){
   state.urlFromNextMusic = false;
   state.lastMediaUrl = "";
   state.playingFromCollection = false;                    // 每首重新判定播放来源
+  state.urlFromBackupSource = false;
   if(!opts.skipCollection) state.collectionFallbackDone = false; // 收集库→音乐源的回退只做一次
   audio.pause(); audio.removeAttribute("src");
 
@@ -1612,7 +1647,8 @@ async function playAt(index, auto=false, opts={}){
     /* ② 收集库未收录 → 调用音乐源 */
     dlgStatusText.textContent = "收集库未收录，正在解析播放地址…";
     if(song.url){
-      url = song.url; // musifei 源歌单数据已带播放地址
+      url = song.url;                            // musifei 源歌单数据已带播放地址（备用源）
+      state.urlFromBackupSource = true;
     }else if(song.source === "nextmusic" && song.songmid){
       // 新数据源：点击时实时解析（getSongUrl）
       try{
@@ -1628,7 +1664,10 @@ async function playAt(index, auto=false, opts={}){
       try{
         const r = await fetch(api("song", song.songmid));
         const arr = await r.json();
-        if(token===state.token && Array.isArray(arr) && arr[0] && arr[0].url) url = arr[0].url;
+        if(token===state.token && Array.isArray(arr) && arr[0] && arr[0].url){
+          url = arr[0].url;                      // musifei 回退补查（备用源）
+          state.urlFromBackupSource = true;
+        }
       }catch(_){ /* 音乐源均不可用 */ }
       if(token!==state.token) return;
     }
