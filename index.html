@@ -925,15 +925,17 @@ const api = (type,id) => `https://vercel-meting-api.musifei.org/api?server=${MUS
 
 /* 网易云的 playlist 接口不返回 songmid，歌曲的数字 id 挂在 songmid 上。 */
 function extractSongId(item){
+  if(item && (item.songmid || item.id)) return String(item.songmid || item.id);
   const m = /[?&]id=(\d+)/.exec((item && (item.url || item.lrc)) || "");
   return m ? m[1] : "";
 }
 
-/* 统一歌手分隔符为 " / "（与 musifei 源的数据格式一致）。
+/* 统一歌手分隔符为 " / "（与 musifei 源及 QQ Parser 的数据格式一致）。
  * 目的：保证 songStem 跨源一致 —— 同一首歌无论经哪个源播放，
  * 收集库去重（list.txt）与归档目录名都相同，不会重复采集。 */
 function normalizeSinger(s){
-  return String(s || "").split("/").map(t => t.trim()).filter(Boolean).join(" / ");
+  if(Array.isArray(s)) s = s.map(v => typeof v === "string" ? v : (v && (v.name || v.title)) || "").join("/");
+  return String(s || "").replace(/[／⁄]/g, "/").split("/").map(t => t.trim()).filter(Boolean).join(" / ");
 }
 
 /* ================= 新数据源（nextmusic）=================
@@ -972,12 +974,12 @@ async function nextMusicRequest(path, body){
   try{ j = await r.json(); }catch(_){ /* body 非 JSON */ }
   if(!j) return { ok:false, code:r.status, data:null, notFound:r.status === 404,
                   message:"HTTP " + r.status };
-  if(j.code !== 200){
+  if(j.code !== 200 || j.data == null){
     return { ok:false, code:j.code, data:j.data || null,
              notFound:j.code === 404 || /不存在/.test(String(j.message || "")),
-             message:j.message || ("接口返回 code " + j.code) };
+             message:j.message || (j.data == null ? "接口返回空数据" : ("接口返回 code " + j.code)) };
   }
-  return { ok:true, code:200, data:j.data || null, notFound:false, message:"" };
+  return { ok:true, code:200, data:j.data, notFound:false, message:"" };
 }
 
 /* 带重试的封装：实测该服务后端会轮换账号，单次请求可能间歇性返回 404 / data:null。
@@ -1259,12 +1261,17 @@ const COLLECTOR_ENABLED = true;
 const COLLECTOR_MIN_DURATION = 60; // 歌曲长度
 
 /* 后台探测歌曲实际时长，满足条件则上报收集器（不阻塞播放，失败静默丢弃） */
+const reportedStems = new Set();
 async function reportToCollector(song, fileUrl){
   if(!COLLECTOR_ENABLED || !COLLECTOR_URL || COLLECTOR_URL.includes("YOUR_ACCOUNT")) return;
   if(!song || !fileUrl || !/^https?:\/\//i.test(fileUrl)) return;
-  // 前端去重：已在收集库中的不上报（Worker 端也有一次检查）
+  // 前端去重：已在收集库中或本会话已上报的不重复上报（Worker 端也有一次检查）
   await musicdbReady;
-  try{ if(MUSICDB_ENABLED && musicdbList.has(collectionStem(song))) return; }catch(_){}
+  let stem = "";
+  try{
+    stem = collectionStem(song);
+    if((MUSICDB_ENABLED && musicdbList.has(stem)) || reportedStems.has(stem)) return;
+  }catch(_){}
   try{
     const probe = new Audio();
     probe.preload = "metadata";
@@ -1276,6 +1283,7 @@ async function reportToCollector(song, fileUrl){
       const dur = probe.duration;
       cleanup();
       if(!isFinite(dur) || dur <= COLLECTOR_MIN_DURATION) return; // ≤60 秒不上报
+      if(stem && reportedStems.has(stem)) return;
       // 在上报时刻再读取 song.lrc，保证拿到 song API 刷新后的最新歌词 url；
       // 新源歌曲的歌词是文本（无 URL），用 musifei 稳定 lrc 代理 URL 补上，
       // 保证收集库归档时同样能拿到歌词（与原有上报格式一致）
@@ -1290,13 +1298,14 @@ async function reportToCollector(song, fileUrl){
         duration: Math.round(dur)
       };
       if(!payload.title || !payload.author || !payload.url) return;
+      if(stem) reportedStems.add(stem);
       fetch(COLLECTOR_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
         mode: "cors",
         keepalive: true
-      }).catch(()=>{ /* 上报失败不打扰用户 */ });
+      }).catch(()=>{ if(stem) reportedStems.delete(stem); /* 上报失败不打扰用户 */ });
     };
     probe.onerror = ()=>{ if(!done){ done=true; clearTimeout(timer); cleanup(); } };
     probe.src = fileUrl;
@@ -1334,18 +1343,23 @@ function applyTheme(t){
     );
   }catch(_){}
 }
+function getSavedTheme(){
+  try{
+    const v = localStorage.getItem("qmp-theme");
+    return (v === "dark" || v === "light") ? v : null;
+  }catch(_){ return null; }
+}
 (function initTheme(){
-  const saved = localStorage.getItem("qmp-theme");
-  const t = saved || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  const t = getSavedTheme() || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
   applyTheme(t);
 })();
 themeBtn.addEventListener("click", ()=>{
   const next = currentTheme()==="dark" ? "light" : "dark";
-  localStorage.setItem("qmp-theme", next);
+  try{ localStorage.setItem("qmp-theme", next); }catch(_){}
   applyTheme(next);
 });
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", e=>{
-  if(!localStorage.getItem("qmp-theme")) applyTheme(e.matches ? "dark" : "light");
+  if(!getSavedTheme()) applyTheme(e.matches ? "dark" : "light");
 });
 
 /* ================= Ripple ================= */
@@ -1391,7 +1405,9 @@ function rgbToHsl(r,g,b){
 /* 取色 / 列表缩略图只需要小图：网易云图床支持 ?param=宽x高 缩放参数。
  * 非网易云来源（例如收集库直链）原样返回，避免拼参数把地址弄坏。 */
 function neteaseThumb(u, size){
-  if(!u || !/music\.126\.net\//.test(u) || /[?&]param=/.test(u)) return u;
+  if(!u || !/music\.126\.net\//.test(u)) return u;
+  u = u.replace(/^http:\/\//i, "https://");
+  if(/[?&]param=/.test(u)) return u;
   return u + (u.indexOf("?") >= 0 ? "&" : "?") + "param=" + size + "y" + size;
 }
 function extractSeedColor(url){
@@ -2222,7 +2238,7 @@ $("#nextBtn").addEventListener("click", ()=>{
 /* ================= Playlist ================= */
 const grid=$("#grid"), secHead=$("#secHead"), secTitle=$("#secTitle"), secSub=$("#secSub"),
       hero=$("#hero"), linearProg=$("#linearProg"), stateMsg=$("#stateMsg"),
-      plInput=$("#plInput"), searchbar=$(".searchbar");
+      plInput=$("#plInput"), filterInput=$("#filterInput"), searchbar=$(".searchbar");
 
 function skeletons(n=10){
   grid.innerHTML="";
@@ -2278,6 +2294,10 @@ let playlistMeta = null; // 新源返回的歌单元信息（名称 / 创建者�
 
 async function loadPlaylist(id){
   const token=++plToken;
+  prefetchToken++;
+  if(dlgOpen || miniOn || state.currentIndex>=0) closeDialog();
+  state.songs=[];
+  if(filterInput) filterInput.value="";
   playlistMeta = null;
   hideState();
   grid.innerHTML="";
@@ -2318,8 +2338,8 @@ async function loadPlaylist(id){
         state.songs = data.songs.map(s => ({
           title: (s.name || "").trim(),
           author: normalizeSinger(s.singer), // 分隔符统一为 " / "，保证收集库 stem 跨源一致
-          pic: s.picimg || "",
-          songmid: String(s.id), // 网易云歌曲数字 id，亦供收集库回退与上报收集器使用
+          pic: String(s.picimg || "").replace(/^http:\/\//i, "https://"),
+          songmid: s.id != null ? String(s.id) : "", // 网易云歌曲数字 id，亦供收集库回退与上报收集器使用
           duration: s.duration || "",
           vip: s.free === false, // 新源 free:false = VIP 歌曲（copyright 仅指官方客户端免费下载，无意义）
           source: "nextmusic"
@@ -2348,8 +2368,15 @@ async function loadPlaylist(id){
       notFoundState();
       return;
     }
-    // 补上 songmid（= 网易云歌曲数字 id），供收集库回退与上报收集器使用
-    state.songs = data.map(s => Object.assign({}, s, { songmid: extractSongId(s) }));
+    // 补上 songmid（= 网易云歌曲数字 id）并统一歌手分隔符，供收集库回退与上报收集器使用
+    state.songs = data.map(s => {
+      const song = s && typeof s === "object" ? s : {};
+      return Object.assign({}, song, {
+        author: normalizeSinger(song.author || song.singer),
+        pic: String(song.pic || "").replace(/^http:\/\//i, "https://"),
+        songmid: extractSongId(song)
+      });
+    });
     renderResult(data.length, "Playlist #" + id);
   }catch(err){
     if(token!==plToken) return;
