@@ -1195,59 +1195,59 @@ async function resolveCoverUrl(song){
 /* 歌词解析：
  *  - musifei 源：歌单自带 lrc（url）→ 缺失时用 song API 补一次；
  *  - 新数据源：点击时实时调 getSongLyric，直接返回 LRC 文本，无需二次抓取；
- *  - 都拿不到时收集库兜底。（fire-and-forget，token 做过期保护）*/
+ *  - 都拿不到时收集库兜底。（按序尝试，songToken 做过期保护）*/
 async function fetchWithTimeout(url, timeout=10000, options={}){
   const ctrl = new AbortController();
   const timer = setTimeout(()=>ctrl.abort(), timeout);
   try{ return await fetch(url, { ...options, signal: ctrl.signal }); }
   finally{ clearTimeout(timer); }
 }
-async function lyricUrlWorks(url, token){
-  try{
-    const r = await fetchWithTimeout(url, 8000, { cache:"no-store" });
-    if(!r.ok) return false;
-    const text = await r.text();
-    return !!text.trim() && !/^\s*(?:<!doctype|<html|\{)/i.test(text);
-  }catch(_){ return false; }
-}
 
 async function resolveLyrics(song, token){
-  const alive = () => token === state.token;
-  if(song.lrc) loadLyrics(song.lrc, token); // loadLyrics 内部先渲染骨架
-  else if(song.lrcText) showLrcText(song.lrcText, token); // 本首已解析过的歌词，直接复用
-  else renderLyricsSkeleton();               // 先占位，避免残留上一首歌词
+  const alive = () => token === state.songToken;
+  if(song.lrcText){
+    const cached = parseLRC(song.lrcText);
+    if(cached.length){ renderLyrics(cached); return; }
+    song.lrcText = "";
+  }
+  renderLyricsSkeleton();                    // 先占位，避免残留上一首歌词
+  if(song.lrc && await loadLyrics(song.lrc, token, true)) return;
+  if(!alive()) return;
   // 新数据源：点击时实时解析歌词
-  if(!song.lrc && !song.lrcText && song.source === "nextmusic" && song.songmid){
+  if(!song.lrc && song.source === "nextmusic" && song.songmid){
     try{
       /* 拿到歌词文本（含“暂无歌词”）时 nextMusicRequest 直接 ok 返回、不会进入重试；
          能触发重试的都是瞬时失败（后端 404 / 超时 / 网络异常）→ 一律重试 */
       const data = await nextMusicApi("getSongLyric", { id: song.songmid }, 2, () => true);
       if(!alive()) return;
       const lrcText = data && typeof data.lrc === "string" ? data.lrc.trim() : "";
-      if(lrcText && lrcText !== "[00:00.00]暂无歌词"){
+      const lines = lrcText ? parseLRC(lrcText) : [];
+      if(lines.length){
         song.lrcText = lrcText;
-        showLrcText(lrcText, token);
+        renderLyrics(lines);
         return;
       }
     }catch(_){ /* 新源不可用 → 继续走下面的回退 */ }
   }
-  // 歌单没带 lrc 才去 song API 补一次（musifei 回退；只取 lrc，url 字段忽略）
-  if(!song.lrc && !song.lrcText && song.songmid){
+  if(!alive()) return;
+  // 歌单没带 lrc 或新源无有效歌词时去 song API 补一次（musifei 回退；只取 lrc，url 字段忽略）
+  if(!song.lrc && song.songmid){
     try{
       const r = await fetchWithTimeout(api("song", song.songmid), 10000);
       const arr = await r.json();
       if(!alive()) return;
       const s = Array.isArray(arr) && arr[0];
-      if(s && s.lrc){ song.lrc = s.lrc; loadLyrics(s.lrc, token); return; }
+      if(s && s.lrc){
+        song.lrc = s.lrc;
+        if(await loadLyrics(s.lrc, token, true)) return;
+      }
     }catch(_){ /* 在线失败则继续走兜底 */ }
   }
   if(!alive()) return;
-  if(song.lrcText) return;
-  if(song.lrc && await lyricUrlWorks(song.lrc, token)) return; // URL 在但内容坏/不可达时继续收集库回退
   const colUrl = await getCollectionFileUrl(song, "lyric");
   if(!alive()) return;
-  if(colUrl) loadLyrics(colUrl, token);
-  else renderLyrics([]);
+  if(colUrl && await loadLyrics(colUrl, token, true)) return;
+  if(alive()) renderLyrics([]);
 }
 
 /* ================= Music Collector =================
@@ -1489,7 +1489,9 @@ let mediaGuard = { token:-1, done:true };
 
 /* 彻底停掉当前音频：暂停 + 清空 src + load()，立即中断正在进行的网络连接 */
 function stopAudio(){
+  clearStartWatchdog();
   mediaGuard = { token:-1, done:true, started:false };
+  state.lastMediaUrl = "";
   try{ audio.pause(); }catch(_){}
   audio.removeAttribute("src");
   try{ audio.load(); }catch(_){}
@@ -1499,6 +1501,7 @@ function stopAudio(){
 function startAudio(token, url){
   mediaGuard = { token, done:false, started:false };
   audio.src = url;
+  state.lastMediaUrl = audio.src;
 }
 
 /* 看门狗到点时复核「是否真的已经播过」：
@@ -1530,8 +1533,8 @@ function handleSourceFailure(reason){
     playAt(state.currentIndex, true, { fallback:true, skipCollection:true });
     return true;
   }
-  /* 在线源出问题 → 回退收集库（只回退一次） */
-  if(state.onlineFallbackDone) return false;
+  /* 在线源出问题 → 回退收集库（只回退一次；若收集库已失败或已确认未收录则不再切回去） */
+  if(state.onlineFallbackDone || state.collectionFallbackDone) return false;
   state.onlineFallbackDone = true;
   stopAudio();
   dlgStatus.classList.remove("show");
@@ -1564,7 +1567,7 @@ function onOnlineStartTimeout(token){
   if(token !== state.token || state.playingFromCollection) return;
   if(mediaStarted()) return;                       // 已经出声 → 不换源
   if(state.userPaused){ dlgStatus.classList.remove("show"); return; } // 用户暂停中：不换源也不跳曲
-  if(state.onlineFallbackDone){
+  if(state.onlineFallbackDone || state.collectionFallbackDone){
     stopAudio();
     dlgStatus.classList.remove("show");
     setPlayUI("play");
@@ -1586,7 +1589,10 @@ function setPlayUI(mode){ // 'loading' | 'play' | 'pause'
 setPlayUI("play");
 
 function togglePlayback(){
-  if(!audio.src) return;
+  if(!audio.src){
+    if(state.currentIndex>=0 && spin.style.display==="none") playAt(state.currentIndex);
+    return;
+  }
   if(audio.paused){
     state.userPaused = false;
     audio.play().catch(()=>snack("播放失败，可能受版权保护"));
@@ -1597,7 +1603,7 @@ function togglePlayback(){
       else                            armStartWatchdog(t, ONLINE_START_TIMEOUT,    ()=>onOnlineStartTimeout(t));
     }
   }
-  else { state.userPaused = true; audio.pause(); }
+  else { state.userPaused = true; clearStartWatchdog(); dlgStatus.classList.remove("show"); audio.pause(); }
 }
 playBtn.addEventListener("click", togglePlayback);
 audio.addEventListener("play",  ()=>{ state.userPaused = false; setPlayUI("pause"); markPlayingCard(true); syncMini(); });
@@ -1622,13 +1628,14 @@ function skipBackupPreview(){
   const idx = state.currentIndex;
   const song = idx >= 0 ? state.songs[idx] : null;
   if(!song || !state.urlFromBackupSource) return false;
-  if(!state.lastMediaUrl || audio.currentSrc !== state.lastMediaUrl) return false; // 防串曲：metadata 必须属于当前地址
+  if(!state.lastMediaUrl || (audio.currentSrc || audio.src) !== state.lastMediaUrl) return false; // 防串曲：metadata 必须属于当前地址
   if(!isFinite(audio.duration) || audio.duration > COLLECTOR_MIN_DURATION) return false;
   // 只加载了元数据、还没出声：先按“在线源播放出问题”回退收集库；
   // 收集库也不可用（或已是二次尝试）时，再按“无法播放”走原有跳曲逻辑（列表循环下自动下一首，且有防死循环保护）
   curTime.textContent = "0:00"; durTime.textContent = "0:00";
   if(handleSourceFailure("在线解析只得到试听片段")) return true;
   stopAudio();
+  dlgStatus.classList.remove("show");
   setPlayUI("play");
   markPlayingCard(false);
   skipOnCopyright("在线解析只得到试听片段（不足 1 分钟），已跳过");
@@ -1650,7 +1657,7 @@ function checkVipExclusive(){
   const servedByUs = state.urlFromNextMusic ||
                      (VIP_TIP_INCLUDE_COLLECTION && state.playingFromCollection);
   if(!servedByUs) return;   // musifei 等其它来源解析出的地址：不算我们的独家解析
-  if(!state.lastMediaUrl || audio.currentSrc !== state.lastMediaUrl) return; // 防串曲：metadata 必须属于当前地址
+  if(!state.lastMediaUrl || (audio.currentSrc || audio.src) !== state.lastMediaUrl) return; // 防串曲：metadata 必须属于当前地址
   if(!isFinite(audio.duration) || audio.duration <= COLLECTOR_MIN_DURATION) return;
   vipExclusiveEl.classList.add("show");
 }
@@ -1694,7 +1701,8 @@ audio.addEventListener("ended", ()=>{
     try{ audio.currentTime = 0; }catch(_){}
     seekSlider.value=0; seekSlider.style.setProperty("--val","0%");
     curTime.textContent="0:00";
-    setPlayUI("play"); markPlayingCard(false);
+    syncLyrics(0);
+    setPlayUI("play"); markPlayingCard(false); syncMini();
     snack("「仅播放此曲目一次」：本曲已播放完毕");
     return;
   }
@@ -1705,10 +1713,14 @@ audio.addEventListener("error", ()=>{
   if(!audio.src) return;
   /* 旧尝试的迟到事件（已 stopAudio / 已换源）直接忽略，别误判成当前源失败去跳曲 */
   if(mediaGuard.token !== state.token || mediaGuard.done) return;
+  clearStartWatchdog();
+  dlgStatus.classList.remove("show");
   setPlayUI("play");
   /* 收集库文件异常（404 / 损坏 / 被拦截）→ 在线源；
      在线源异常 → 回退收集库；两边都只回退一次（见 handleSourceFailure） */
   if(handleSourceFailure("文件异常")) return;
+  stopAudio();
+  markPlayingCard(false);
   skipOnCopyright("音频加载失败，重新点击该歌曲试试");
 });
 seekSlider.addEventListener("input", ()=>{
@@ -1717,7 +1729,8 @@ seekSlider.addEventListener("input", ()=>{
   if(isFinite(audio.duration)) curTime.textContent = fmtTime(seekSlider.value/1000*audio.duration);
 });
 seekSlider.addEventListener("change", ()=>{
-  if(isFinite(audio.duration)) audio.currentTime = seekSlider.value/1000*audio.duration;
+  if(isFinite(audio.duration) && audio.duration>0) audio.currentTime = seekSlider.value/1000*audio.duration;
+  else { seekSlider.value=0; seekSlider.style.setProperty("--val","0%"); curTime.textContent="0:00"; }
   seeking=false;
 });
 volSlider.addEventListener("input", ()=>{
@@ -1743,15 +1756,17 @@ const lyricsScroll=$("#lyricsScroll"), lyrEmpty=$("#lyrEmpty"), lyrEmptyText=$("
 let lyricLines=[], lyricEls=[], curLine=-1;
 
 function parseLRC(text){
-  const out=[]; const re=/\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]/g;
-  for(const raw of text.split(/\r?\n/)){
+  const out=[]; const re=/\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]/g;
+  for(const raw of String(text||"").split(/\r?\n/)){
     if(/^\[(ti|ar|al|by|offset|re|ve|au|length)\s*:/i.test(raw.trim())) continue;
     let m, times=[]; re.lastIndex=0;
     while((m=re.exec(raw))) times.push(+m[1]*60 + +m[2] + (m[3]?+("0."+m[3]):0));
-    const txt = raw.replace(/(\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\])/g,"").trim();
-    for(const t of times) if(txt) out.push({t, txt});
+    const txt = raw.replace(/(\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\])/g,"").trim();
+    if(!txt || /^暂无歌词$/.test(txt)) continue;
+    for(const t of times) out.push({t, txt});
   }
   out.sort((a,b)=>a.t-b.t);
+  if(out.length===1 && /^(?:暂无歌词|纯音乐[\s，,、·]*请欣赏)$/.test(out[0].txt)) return [];
   return out;
 }
 function renderLyricsSkeleton(){
@@ -1780,6 +1795,7 @@ function renderLyrics(lines){
     lyricsScroll.appendChild(p);
     return p;
   });
+  if(audio.src) syncLyrics(audio.currentTime);
 }
 function syncLyrics(t){
   if(!lyricLines.length) return;
@@ -1795,34 +1811,36 @@ function syncLyrics(t){
   if(i>=0 && lyricEls[i]){
     const target = lyricEls[i].offsetTop - lyricsScroll.clientHeight*.38;
     lyricsScroll.scrollTo({top:centerTarget(target), behavior:"smooth"});
+  }else if(lyricsScroll.scrollTop > 0){
+    lyricsScroll.scrollTo({top:0, behavior:"smooth"});
   }
 }
 function centerTarget(v){ return Math.max(0, v); }
-/* 直接渲染 LRC 文本（新数据源 getSongLyric 返回的就是文本本身） */
-function showLrcText(text, token){
-  if(token!==state.token) return;
-  renderLyrics(parseLRC(text));
-}
-async function loadLyrics(url, token){
-  renderLyricsSkeleton();
+async function loadLyrics(url, token, silentOnEmpty=false){
   try{
     const r = await fetchWithTimeout(url, 10000);
     if(!r.ok) throw 0;
     let text = await r.text();
     const t=text.trim();
-    if(t.startsWith("{")){ try{ const j=JSON.parse(t); text=j.lyric||j.lrc||j.data||text; }catch(_){}
-      if(typeof text!=="string") text=String(text);
+    if(/^\s*(?:<!doctype|<html)/i.test(t)) throw 0;
+    if(t.startsWith("{")){
+      try{ const j=JSON.parse(t); text=j.lyric||j.lrc||j.data||""; }catch(_){ text=""; }
+      if(typeof text!=="string") text=String(text||"");
     }
-    showLrcText(text, token);
+    if(token!==state.songToken) return false;
+    const lines = parseLRC(text);
+    if(lines.length){ renderLyrics(lines); return true; }
+    if(!silentOnEmpty) renderLyrics([]);
+    return false;
   }catch(_){
-    if(token!==state.token) return;
-    renderLyrics([]);
+    if(token===state.songToken && !silentOnEmpty) renderLyrics([]);
+    return false;
   }
 }
 
 /* ================= State ================= */
 const state = {
-  songs:[], currentIndex:-1, token:0, mode:"list" /* list | one | once */, skipCount:0,
+  songs:[], currentIndex:-1, token:0, songToken:0, mode:"list" /* list | one | once */, skipCount:0,
   urlFromNextMusic:false, // 当前播放地址是否来自新数据源（getSongUrl）
   lastMediaUrl:"",        // 当前 audio.src 对应的 url，供 loadedmetadata 防串曲校验
   playingFromCollection:false, // 当前播放地址是否来自收集库（文件异常时回退音乐源用）
@@ -1888,6 +1906,12 @@ function closeDialog(){
   clearStartWatchdog();
   stopAudio();
   state.token++;
+  state.songToken++;
+  seeking=false;
+  coverImg.removeAttribute("src");
+  coverImg.style.display="none";
+  coverPh.style.display="grid";
+  coverBox.classList.remove("loading");
   markPlayingCard(false); state.currentIndex=-1;
   vipExclusiveEl.classList.remove("show");
   state.urlFromNextMusic=false; state.lastMediaUrl="";
@@ -1945,8 +1969,13 @@ function syncMini(){
   if(miniTitleEl.textContent !== t) miniTitleEl.textContent = t;
   if(miniArtistEl.textContent !== a) miniArtistEl.textContent = a;
   const pic = coverImg.getAttribute("src") || "";
-  if(pic && miniCoverImg.getAttribute("src") !== pic) miniCoverImg.src = pic;
-  miniCoverImg.style.display = pic ? "block" : "none";
+  if(pic){
+    if(miniCoverImg.getAttribute("src") !== pic) miniCoverImg.src = pic;
+    miniCoverImg.style.display = "block";
+  }else{
+    miniCoverImg.removeAttribute("src");
+    miniCoverImg.style.display = "none";
+  }
   const playing = !!audio.src && !audio.paused;
   miniIcPlay.style.display  = playing ? "none"  : "block";
   miniIcPause.style.display = playing ? "block" : "none";
@@ -1982,30 +2011,47 @@ function markPlayingCard(on){
 const coverPh = coverBox.querySelector(".ph");
 async function setCover(song, token){
   coverBox.classList.add("loading");
+  coverImg.removeAttribute("src");
   coverImg.style.display="none";
   coverPh.style.display="grid";
+  if(miniOn) syncMini();
   let pic = await resolveCoverUrl(song); // 在线优先，缺失时用收集库
-  if(token!==state.token) return;
+  if(token!==state.songToken) return;
   if(!pic){ coverBox.classList.remove("loading"); return; }
   let fellBack = false;
   const img=new Image();
   img.onload = ()=>{
-    if(token!==state.token) return;
+    if(token!==state.songToken) return;
     coverImg.src=pic; coverImg.style.display="block";
     coverPh.style.display="none"; coverBox.classList.remove("loading");
     if(miniOn) syncMini();
   };
   img.onerror= async ()=>{
-    if(token!==state.token) return;
+    if(token!==state.songToken) return;
     // 在线图坏了 → 试收集库（只兜底一次）
     if(!fellBack && song.pic && pic===song.pic){
       fellBack = true;
       const colPic = await getCollectionFileUrl(song, "cover");
-      if(token===state.token && colPic){ pic=colPic; img.src=colPic; return; }
+      if(token===state.songToken && colPic){ pic=colPic; img.src=colPic; return; }
     }
     coverImg.style.display="none"; coverPh.style.display="grid"; coverBox.classList.remove("loading");
   };
   img.src=pic;
+}
+
+async function resolveDynamicColor(song, token){
+  seedHSL = null;
+  let hsl = null;
+  if(song.pic) hsl = await extractSeedColor(song.pic);
+  if(token!==state.songToken) return;
+  if(!hsl){
+    const colPic = await getCollectionFileUrl(song, "cover");
+    if(token!==state.songToken) return;
+    if(colPic && colPic !== song.pic) hsl = await extractSeedColor(colPic);
+    if(token!==state.songToken) return;
+  }
+  if(hsl){ seedHSL = hsl; applyDynamicPalette(hsl.h, hsl.s); }
+  else clearDynamicPalette();
 }
 
 async function playAt(index, auto=false, opts={}){
@@ -2014,16 +2060,15 @@ async function playAt(index, auto=false, opts={}){
   if(!auto) state.skipCount = 0; // 手动选择曲目时重置连续跳过计数
   const token = ++state.token;
   state.currentIndex = index;
+  seeking = false;
   markPlayingCard(!audio.paused);
 
   // UI reset
   songTitle.textContent = song.title || "未知曲目";
   songAuthor.textContent = song.author || "未知歌手";
-  if(miniOn) syncMini();            // 最小化状态下切歌，迷你控件跟着换
   midNote.textContent = song.songmid ? "ID · "+song.songmid : "";
   dlgTag.textContent = "Track "+(index+1)+" / "+state.songs.length;
   document.title = (song.title||"未知曲目")+" - "+(song.author||"")+" · Playlist Parser";
-  setCover(song, token);
   seekSlider.value=0; seekSlider.style.setProperty("--val","0%");
   curTime.textContent="0:00"; durTime.textContent="0:00";
   setPlayUI("loading");
@@ -2033,27 +2078,21 @@ async function playAt(index, auto=false, opts={}){
   state.lastMediaUrl = "";
   state.playingFromCollection = false;
   state.urlFromBackupSource = false;
-  if(!opts.fallback){                                     // 只有新的一次播放才重置回退记录（回退时保留，防死循环）
+  if(!opts.fallback){                                     // 只有新的一次播放才重置回退记录与封面/歌词（回退时保留，防闪烁与死循环）
+    const songToken = ++state.songToken;
     state.collectionFallbackDone = false;
     state.onlineFallbackDone = false;
     state.userPaused = false;                             // 新的一次播放：恢复自动播放
+    setCover(song, songToken);
+    resolveDynamicColor(song, songToken);
+    resolveLyrics(song, songToken);
+  }else if(miniOn){
+    syncMini();
   }
   stopAudio();                                            // 中断上一首 / 上一个源的连接
 
   /* 收集库「6 秒内必须起播」的总预算：从本次播放进入起算，包含 info.json 查询与音频缓冲 */
   const collectionDeadline = Date.now() + COLLECTION_START_TIMEOUT;
-
-  // Dynamic accent from cover (non-blocking, uses effective cover incl. collection fallback)
-  resolveCoverUrl(song).then(pic=>{
-    if(pic && token===state.token){
-      extractSeedColor(pic).then(hsl=>{
-        if(hsl && token===state.token){ seedHSL=hsl; applyDynamicPalette(hsl.h, hsl.s); }
-      });
-    }
-  });
-
-  // Lyrics：新源点击时实时解析（getSongLyric），musifei 源走歌单 lrc / song API，都没有则用收集库兜底
-  resolveLyrics(song, token);
 
   let url = "";
   let fromCollection = false;
@@ -2070,7 +2109,8 @@ async function playAt(index, auto=false, opts={}){
       state.playingFromCollection = true;
       dlgTag.textContent += " · 收集库";
     }else{
-      if(url) state.collectionFallbackDone = true; // 查询本身就用完了 6 秒预算：算收集库失败
+      if(!url && Date.now() < collectionDeadline) state.collectionFallbackDone = true; // 收集库已确认未收录，后续在线失败不再回退收集库
+      else if(url) state.collectionFallbackDone = true; // 查询本身就用完了 6 秒预算：算收集库失败
       url = "";
     }
   }
@@ -2109,8 +2149,8 @@ async function playAt(index, auto=false, opts={}){
   if(!url){
     dlgStatus.classList.remove("show");
     setPlayUI("play");
-    /* 在线源没解析到地址 → 若还没回退过收集库，再给收集库一次机会 */
-    if(!opts.skipOnline && !state.onlineFallbackDone){
+    /* 在线源没解析到地址 → 若收集库此前因超时被跳过且尚未回退过，再给收集库一次机会 */
+    if(!opts.skipOnline && !state.onlineFallbackDone && !state.collectionFallbackDone){
       state.onlineFallbackDone = true;
       snack("解析时出现问题，回退收集库…");
       playAt(index, true, { fallback:true, skipOnline:true });
@@ -2122,7 +2162,6 @@ async function playAt(index, auto=false, opts={}){
   // 上报收集器：成功拿到在线 url，后台校验实际时长 >60s 后自动上报（不阻塞播放）；
   // 收集库播出的本来就已收集，不上报
   if(!fromCollection) reportToCollector(song, url);
-  state.lastMediaUrl = url;
 
   /* ③ 开始加载：按来源开启「必须起播」的看门狗（到点用 mediaStarted() 复核，真播过就不换源） */
   dlgStatus.classList.add("show");
@@ -2147,16 +2186,27 @@ async function playAt(index, auto=false, opts={}){
       markPlayingCard(true);
     }).catch((err)=>{
       if(token!==state.token) return;
+      if(state.userPaused || (err && err.name === "AbortError")){
+        clearStartWatchdog();
+        dlgStatus.classList.remove("show");
+        setPlayUI("play");
+        return;
+      }
       setPlayUI("play");
       /* 浏览器自动播放拦截（NotAllowedError）不是播放源的问题：
          撤销看门狗并转为「等待用户点击播放」，否则定时器会一直换源、最后误跳曲 */
       if(err && err.name === "NotAllowedError"){
         clearStartWatchdog();
+        dlgStatus.classList.remove("show");
         state.userPaused = true;
         snack("浏览器拦截了自动播放，请点击播放按钮");
         return;
       }
-      handleSourceFailure("播放请求被拒绝");
+      if(handleSourceFailure("播放请求被拒绝")) return;
+      stopAudio();
+      dlgStatus.classList.remove("show");
+      markPlayingCard(false);
+      skipOnCopyright("该歌曲因版权 / 付费限制暂时无法播放");
     });
   }
 }
