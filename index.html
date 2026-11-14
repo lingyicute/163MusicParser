@@ -2415,6 +2415,8 @@ function renderSongs(){
 }
 
 let plToken=0;
+const PLAYLIST_PAGE_SIZE = 500;   // playlist_trackall 单页条数
+const PLAYLIST_MAX_PAGES = 20;    // 最多翻 20 页（1 万首），防接口异常时无限翻页
 let playlistMeta = null; // 新源返回的歌单元信息（名称 / 创建者），用于区头展示
 
 async function loadPlaylist(id){
@@ -2451,16 +2453,36 @@ async function loadPlaylist(id){
     let notFound = false;
     try{
       /* “歌单不存在”是确定性结果，不重试；网络 / 5xx 等瞬时失败重试一次再走回退 */
-      const data = await nextMusicApi("playlist_trackall", { id: id, limit: 500, offset: 0 }, 1,
+      const data = await nextMusicApi("playlist_trackall", { id: id, limit: PLAYLIST_PAGE_SIZE, offset: 0 }, 1,
         r => !r.notFound);
       if(token!==plToken) return;
       if(data && Array.isArray(data.songs) && data.songs.length){
+        /* 接口单次最多返回 limit 首：按 songCount 继续翻页，否则超过 500 首的歌单会被静默截断。
+           以歌曲 id 去重，某页没有新歌（接口忽略 offset / 已到末尾）即停止 */
+        const rawSongs = data.songs.filter(s => s && typeof s === "object");
+        const seen = new Set(rawSongs.map(s => s.id));
+        const total = +data.songCount || 0;
+        let offset = data.songs.length, partial = false;
+        for(let page = 1; page < PLAYLIST_MAX_PAGES && rawSongs.length < total; page++){
+          let more = null;
+          try{
+            more = await nextMusicApi("playlist_trackall", { id: id, limit: PLAYLIST_PAGE_SIZE, offset: offset }, 1,
+              r => !r.notFound);
+          }catch(_){ partial = true; }
+          if(token!==plToken) return;
+          const list = more && Array.isArray(more.songs) ? more.songs : [];
+          const fresh = list.filter(s => s && typeof s === "object" && !seen.has(s.id));
+          if(!fresh.length){ if(!partial && rawSongs.length < total && list.length) partial = true; break; }
+          fresh.forEach(s => seen.add(s.id));
+          rawSongs.push(...fresh);
+          offset += list.length;
+        }
         playlistMeta = {
           name: (data.name || "").trim(),
           creator: ((data.creator && data.creator.name) || "").trim()
         };
         // 新源歌曲不带 url / lrc，点击时由 getSongUrl / getSongLyric 实时解析
-        state.songs = data.songs.map(s => ({
+        state.songs = rawSongs.map(s => ({
           title: (s.name || "").trim(),
           author: normalizeSinger(s.singer), // 分隔符统一为 " / "，保证收集库 stem 跨源一致
           pic: String(s.picimg || "").replace(/^http:\/\//i, "https://"),
@@ -2473,6 +2495,7 @@ async function loadPlaylist(id){
         const metaLabel = [playlistMeta.name, playlistMeta.creator].filter(Boolean).join(" by ")
                         || ("Playlist #" + id);
         renderResult(state.songs.length, metaLabel);
+        if(partial) snack("后续分页加载失败，仅显示前 " + state.songs.length + " / " + total + " 首");
         return;
       }
       notFound = true; // 新源返回空列表
